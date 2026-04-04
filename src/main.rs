@@ -14,6 +14,9 @@ use std::{
 };
 use which::which;
 
+const ABRASIVE_DIR: &str = ".abrasive";
+const KEY_NAME: &str = "id_ed25519";
+
 #[derive(Debug, Deserialize)]
 struct Config {
     remote: RemoteConfig,
@@ -36,8 +39,22 @@ fn default_ssh_port() -> u16 { 22 }
 fn default_build_dir() -> String { "~/abrasive-builds".to_string() }
 fn default_exclude() -> Vec<String> { vec!["target".to_string(), ".git".to_string()] }
 
+fn abrasive_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(ABRASIVE_DIR)
+}
+
+fn ssh_key_path() -> PathBuf {
+    abrasive_dir().join(KEY_NAME)
+}
+
+fn ssh_args(port: u16) -> String {
+    let key = ssh_key_path();
+    format!("ssh -p {} -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes", port, key.display())
+}
+
 /// Walk up from `start` looking for abrasive.toml.
-/// Returns (path_to_toml, project_root_dir).
 fn find_config(start: &Path) -> Option<(PathBuf, PathBuf)> {
     let mut dir = start.to_path_buf();
     loop {
@@ -51,9 +68,6 @@ fn find_config(start: &Path) -> Option<(PathBuf, PathBuf)> {
     }
 }
 
-/// Compute the relative path from project_root to cwd.
-/// e.g. if root is /home/user/myproject and cwd is /home/user/myproject/crates/foo
-/// returns Some("crates/foo").
 fn relative_subdir(project_root: &Path, cwd: &Path) -> Option<PathBuf> {
     cwd.strip_prefix(project_root).ok().and_then(|rel| {
         if rel.as_os_str().is_empty() {
@@ -85,13 +99,16 @@ fn run_local(args: &[String]) -> ExitCode {
 fn run_remote(config: &Config, project_root: &Path, subdir: Option<PathBuf>, args: &[String]) -> ExitCode {
     let remote = &config.remote;
 
-    // Check rsync is available
+    if !ssh_key_path().exists() {
+        error!("No abrasive SSH key found. Run 'abrasive auth' first.");
+        return ExitCode::from(1);
+    }
+
     which("rsync").unwrap_or_else(|e| {
         error!("rsync not found in $PATH, please install it ({e})");
         exit(1);
     });
 
-    // Build a stable remote path from the project root
     let project_name = project_root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -107,7 +124,7 @@ fn run_remote(config: &Config, project_root: &Path, subdir: Option<PathBuf>, arg
         .arg("--delete")
         .arg("--compress")
         .arg("-e")
-        .arg(format!("ssh -p {}", remote.ssh_port))
+        .arg(ssh_args(remote.ssh_port))
         .arg("--info=progress2");
 
     for pattern in &remote.exclude {
@@ -144,7 +161,7 @@ fn run_remote(config: &Config, project_root: &Path, subdir: Option<PathBuf>, arg
         None => build_path.clone(),
     };
 
-    let mut remote_cmd = String::new();
+    let mut remote_cmd = String::from("source ~/.cargo/env 2>/dev/null; ");
 
     if let Some(env_file) = &remote.env_file {
         remote_cmd.push_str(&format!("source {env_file} && "));
@@ -154,9 +171,13 @@ fn run_remote(config: &Config, project_root: &Path, subdir: Option<PathBuf>, arg
 
     info!("Running: cargo {} (on {})", args.join(" "), remote.host);
 
+    let key = ssh_key_path();
     let ssh_status = Command::new("ssh")
         .env("LC_ALL", "C.UTF-8")
         .args(["-p", &remote.ssh_port.to_string()])
+        .args(["-i", &key.to_string_lossy()])
+        .args(["-o", "IdentitiesOnly=yes"])
+        .args(["-o", "BatchMode=yes"])
         .arg("-t")
         .arg(&remote.host)
         .arg(&remote_cmd)
@@ -181,7 +202,6 @@ fn main() -> ExitCode {
 
     let all_args: Vec<String> = env::args().collect();
 
-    // If invoked as "abrasive --version" or "abrasive --help", handle it
     if all_args.len() == 2 && (all_args[1] == "--version" || all_args[1] == "-V") {
         println!("abrasive {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
@@ -197,22 +217,24 @@ fn main() -> ExitCode {
         println!("the cargo command is forwarded to the configured remote build server.");
         println!("Otherwise, cargo is invoked locally.");
         println!();
-        println!("SETUP:");
+        println!("COMMANDS:");
         println!("    abrasive setup            Create abrasive.toml interactively");
+        println!("    abrasive auth             Set up SSH authentication to your build server");
         return ExitCode::SUCCESS;
     }
 
-    // Everything after argv[0] is forwarded to cargo
     let cargo_args: Vec<String> = all_args[1..].to_vec();
 
     if cargo_args.is_empty() {
-        // No args — just run cargo with no args (shows cargo help)
         return run_local(&cargo_args);
     }
 
-    // Handle "abrasive setup" / "cargo setup"
     if cargo_args[0] == "setup" {
         return run_setup();
+    }
+
+    if cargo_args[0] == "auth" {
+        return run_auth();
     }
 
     let cwd = env::current_dir().unwrap_or_else(|e| {
@@ -265,6 +287,98 @@ host = "your-build-server"
 
     println!("Created abrasive.toml — edit it to set your remote build server.");
     ExitCode::SUCCESS
+}
+
+fn run_auth() -> ExitCode {
+    let dir = abrasive_dir();
+    let key = ssh_key_path();
+    let pub_key = key.with_extension("pub");
+
+    // 1. Find config to get the host
+    let cwd = env::current_dir().unwrap_or_else(|e| {
+        error!("Cannot determine current directory: {e}");
+        exit(1);
+    });
+
+    let (config_path, _) = match find_config(&cwd) {
+        Some(c) => c,
+        None => {
+            error!("No abrasive.toml found. Run 'abrasive setup' first, then 'abrasive auth'.");
+            return ExitCode::from(1);
+        }
+    };
+
+    let config_str = fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        error!("Failed to read {}: {e}", config_path.display());
+        exit(1);
+    });
+    let config: Config = toml::from_str(&config_str).unwrap_or_else(|e| {
+        error!("Failed to parse {}: {e}", config_path.display());
+        exit(1);
+    });
+
+    // 2. Generate key if it doesn't exist
+    if key.exists() {
+        println!("SSH key already exists at {}", key.display());
+    } else {
+        fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            error!("Failed to create {}: {e}", dir.display());
+            exit(1);
+        });
+
+        println!("Generating SSH key...");
+        let status = Command::new("ssh-keygen")
+            .args(["-t", "ed25519"])
+            .args(["-f", &key.to_string_lossy()])
+            .args(["-N", ""])  // no passphrase
+            .args(["-C", "abrasive"])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => println!("Key generated at {}", key.display()),
+            _ => {
+                error!("Failed to generate SSH key");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // 3. Copy public key to the server
+    println!("Copying key to {}...", config.remote.host);
+    println!("You may be prompted for your server password one last time.");
+
+    let pub_key_content = fs::read_to_string(&pub_key).unwrap_or_else(|e| {
+        error!("Failed to read public key: {e}");
+        exit(1);
+    });
+
+    let mkdir_and_append = format!(
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '{}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys",
+        pub_key_content.trim()
+    );
+
+    let status = Command::new("ssh")
+        .args(["-p", &config.remote.ssh_port.to_string()])
+        .args(["-o", "StrictHostKeyChecking=accept-new"])
+        .arg(&config.remote.host)
+        .arg(mkdir_and_append)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::inherit())
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!();
+            println!("Done! Abrasive is now authenticated with {}.", config.remote.host);
+            println!("You won't be prompted for a password again.");
+            ExitCode::SUCCESS
+        }
+        _ => {
+            error!("Failed to copy key to server. Check your password and try again.");
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[cfg(test)]
