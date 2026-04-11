@@ -24,6 +24,7 @@ use std::{
 const IP: &str = "157.180.55.180";
 const PORT: u16 = 8400;
 const REMOTE_COMMANDS: &[&str] = &["build", "run", "test", "bench", "check", "clippy", "doc", "nop", "clean"];
+const ABRASIVE_COMMANDS: &[&str] = &["setup", "auth", "--version", "-V", "--help", "-h", "workspace", "-w"];
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().bold())
@@ -499,8 +500,8 @@ fn find_abrasive_toml(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Transparent on unix, probably close enough on windows
 fn forward_args_to_local() -> CliResult<ExitCode> {
+/// Transparent on unix, probably close enough on windows
     let args: Vec<String> = env::args().skip(1).collect();
     #[cfg(unix)]
     {
@@ -525,28 +526,38 @@ fn should_go_remote(args: &[String]) -> bool {
         .map_or(false, |cmd| REMOTE_COMMANDS.contains(&cmd.as_str()))
 }
 
+fn is_abrasive_command() -> bool {
+    env::args()
+        .nth(1)
+        .map_or(true, |arg| ABRASIVE_COMMANDS.contains(&arg.as_str()))
+}
+
 fn run() -> CliResult<ExitCode> {
-    // First, Check if we are in an abrasive workspace
-    // if not forward args to local cargo
     spawn_agent_for_next_time();
+
+    if is_abrasive_command() {
+        let cli = Cli::parse();
+        match cli.command {
+            Some(Command::Setup) => remote_setup()?,
+            Some(Command::Auth) => login()?,
+            Some(Command::Version) => print_version(),
+            Some(Command::Help) => print_help(),
+            Some(Command::Workspace) => print_workspace()?,
+            None => print_help(),
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let ctx = match get_workspace()? {
         None => return forward_args_to_local(),
         Some(ctx) => ctx,
     };
 
-    // Things Abrasive handles
     let cli = Cli::parse();
     match cli.command {
-        Some(Command::Setup) => remote_setup()?,
-        Some(Command::Auth) => login()?,
-        Some(Command::Version) => print_version(),
-        Some(Command::Help) => print_help(),
-        Some(Command::Workspace) => print_workspace()?,
-        None if cli.cargo_args.is_empty() => print_help(),
         None => return try_remote(&ctx, cli.cargo_args),
+        _ => unreachable!(),
     }
-
-    Ok(ExitCode::SUCCESS)
 }
 
 fn main() -> ExitCode {
