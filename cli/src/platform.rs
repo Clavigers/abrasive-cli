@@ -35,8 +35,8 @@ pub fn host_triple() -> PlatformTriple {
 
     let abi = if cfg!(target_env = "gnu") {
         Abi::Gnu
-    } else if cfg!(target_env = "gnu") {
-        Abi::Musl
+    } else if cfg!(target_env = "musl") {
+        Abi::Gnu
     } else if cfg!(target_env = "msvc") {
         Abi::Msvc
     } else if cfg!(target_os = "macos") {
