@@ -35,6 +35,10 @@ pub enum Message {
     },
     ProbeAccepted,
     ProbeMiss,
+    
+    /// Vanity, tips are basically just our ping. 
+    TipRequest,
+    Tip(String),
 }
 
 impl Message {
@@ -54,6 +58,8 @@ impl Message {
             Message::Probe { .. } => "Probe",
             Message::ProbeAccepted => "ProbeAccepted",
             Message::ProbeMiss => "ProbeMiss",
+            Message::TipRequest => "TipRequest",
+            Message::Tip(_) => "Tip",
         }
     }
 }

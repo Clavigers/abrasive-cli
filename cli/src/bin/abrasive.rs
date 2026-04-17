@@ -1,5 +1,5 @@
 /// This is the entry point fot the abrasive CLI
-/// 
+///
 use abrasive::agent;
 use abrasive::auth;
 use abrasive::errors::{self, CliError, CliResult};
@@ -25,8 +25,21 @@ use std::{
 
 const IP: &str = "157.180.55.180";
 const PORT: u16 = 8400;
-const REMOTE_COMMANDS: &[&str] = &["build", "run", "test", "bench", "check", "clippy", "doc", "nop", "clean"];
-const ABRASIVE_COMMANDS: &[&str] = &["setup", "auth", "--version", "-V", "--help", "-h", "workspace", "-w"];
+const REMOTE_COMMANDS: &[&str] = &[
+    "build", "run", "test", "bench", "check", "clippy", "doc", "nop", "clean",
+];
+const ABRASIVE_COMMANDS: &[&str] = &[
+    "setup",
+    "auth",
+    "--version",
+    "-V",
+    "--help",
+    "-h",
+    "workspace",
+    "-w",
+    "tip",
+    "-t",
+];
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().bold())
@@ -60,6 +73,11 @@ enum Command {
     /// Print the workspace info
     #[command(name = "workspace", aliases = ["-w"])]
     Workspace,
+    /// Vanity, print a fortune cookie like thing.
+    /// I am just adding this as a dummy change to test the server
+    /// auto reloading.
+    #[command(name = "tip", aliases = ["-t"])]
+    Tip,
 }
 
 /// Print the Abrasive help first, followed by the cargo help
@@ -71,14 +89,34 @@ fn print_help() {
 }
 
 /// Print the Abrasive workspace info
-fn print_workspace() -> CliResult<()> {
-    match get_workspace()? {
-        Some(ctx) => println!("{:?}, {:?}", ctx.root_dir, ctx.subdir),
+fn print_workspace(ctx: &Option<WorkspaceContext>) -> CliResult<()> {
+    match ctx {
+        // todo impl display on workspace ctx
+        Some(ctx) => println!("{:?}, {:?}", ctx.root_dir, ctx.subdir), 
         None => println!(
-            "This is not an abrasive workspace. abrasive commands run from here will pass through to cargo"
+            "This is not an abrasive workspace. Abrasive commands run from here will pass through to cargo"
         ),
     }
     Ok(())
+}
+
+/// Vanity, print a tip from the server
+fn print_tip() -> CliResult<()> {
+    let token = auth::saved_token().ok_or(errors::AuthError::NoSavedToken)?;
+
+    let mut stream = open_connection(&token)?;
+    send_frame(&mut stream, &Message::TipRequest)?;
+
+    match recv_frame(&mut stream)? {
+        Message::Tip(the_tip) => {
+            println!("{}", the_tip);
+            Ok(())
+        },
+        other => {
+            eprintln!("[tip] unexpected tip request response: {other:?}");
+            Err(CliError::disconnected())?
+        }
+    }
 }
 
 /// Print the Abrasive help first, followed by the cargo help
@@ -87,7 +125,11 @@ fn print_version() {
     let _ = Cmd::new("cargo").arg("--version").status();
 }
 
-fn remote_setup() -> CliResult<()> {
+fn remote_setup(ctx: &Option<WorkspaceContext>) -> CliResult<()> {
+    if ctx.is_some() {
+        eprintln!("Setup failed, abrasive.toml already exists");
+        return Ok(());
+    }
     let cwd = env::current_dir().map_err(CliError::no_cwd)?;
     let scope = cwd
         .file_name()
@@ -95,14 +137,15 @@ fn remote_setup() -> CliResult<()> {
         .ok_or_else(|| CliError::invalid_path(cwd.display().to_string()))?
         .to_string();
     let toml_path = cwd.join("abrasive.toml");
-    if toml_path.exists() {
-        eprintln!("abrasive.toml already exists");
-        return Ok(());
-    }
     let content = format!("[remote]\nhost = \"{IP}\"\nteam = \"public\"\nscope = \"{scope}\"\n");
     fs::write(&toml_path, &content)?;
     eprintln!("created abrasive.toml (team=public, scope={scope})");
     let ctx = WorkspaceContext::from_paths(&toml_path, &cwd)?;
+
+    // this is a bit of a dumb hack, the reason we send this nop command to the remote
+    // is that was just the easiest way in the moment to send a do nothing command to
+    // the remote (which I want to do as a bit of a hack here to warm the remote. mostly
+    // to sync the source)
     try_remote(&ctx, vec!["nop".to_string()])?;
     Ok(())
 }
@@ -180,7 +223,9 @@ enum Conn {
 impl Conn {
     fn send_raw(&mut self, data: Vec<u8>) -> io::Result<()> {
         match self {
-            Conn::Ws(ws) => ws.send(tungstenite::Message::Binary(data)).map_err(ws_to_io),
+            Conn::Ws(ws) => ws
+                .send(tungstenite::Message::Binary(data))
+                .map_err(ws_to_io),
             Conn::Agent(s) => agent::write_msg(s, &data),
         }
     }
@@ -191,7 +236,7 @@ impl Conn {
                 match ws.read().map_err(ws_to_io)? {
                     tungstenite::Message::Binary(data) => break Ok(data),
                     tungstenite::Message::Close(_) => {
-                        break Err(io::Error::new(io::ErrorKind::ConnectionReset, "closed"))
+                        break Err(io::Error::new(io::ErrorKind::ConnectionReset, "closed"));
                     }
                     _ => continue,
                 }
@@ -223,12 +268,7 @@ enum SyncOutcome {
     SlotsBusy,
 }
 
-fn start_sync(
-    stream: &mut Conn,
-    root: &Path,
-    team: &str,
-    scope: &str,
-) -> CliResult<SyncOutcome> {
+fn start_sync(stream: &mut Conn, root: &Path, team: &str, scope: &str) -> CliResult<SyncOutcome> {
     let manifest = build_and_log_manifest(root, team, scope);
     send_frame(stream, &Message::Manifest(manifest))?;
     match recv_frame(stream)? {
@@ -389,7 +429,9 @@ fn open_connection(token: &str) -> CliResult<Conn> {
         TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(CliError::connect)?;
     tcp.set_read_timeout(Some(Duration::from_secs(300)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(30)))?;
-    Ok(Conn::Ws(tls::connect(tcp, token).map_err(CliError::connect)?))
+    Ok(Conn::Ws(
+        tls::connect(tcp, token).map_err(CliError::connect)?,
+    ))
 }
 
 fn resolve_agent_bin() -> Option<PathBuf> {
@@ -400,6 +442,12 @@ fn resolve_agent_bin() -> Option<PathBuf> {
     Some(exe.parent()?.join("abrasive-agent"))
 }
 
+/// This is sort of just a performance hack. The idea is we can avoid
+/// the Websocket handshake time if we leave open the websocket in
+/// another process, and next time we wanna talk to the remote we pipe
+/// our message to that long lived process (here called abrasive-agent)
+/// and it forwards the message to the remote. this speed does matter
+/// for cache hits (since they are so fast 100ms-1s makes a big diff)
 fn spawn_agent_for_next_time() {
     if UnixStream::connect(agent::socket_path()).is_ok() {
         return;
@@ -513,7 +561,7 @@ fn find_abrasive_toml(start: &Path) -> Option<PathBuf> {
 }
 
 fn forward_args_to_local() -> CliResult<ExitCode> {
-// Transparent on unix, probably close enough on windows
+    // Transparent on unix, probably close enough on windows
     let args: Vec<String> = env::args().skip(1).collect();
     #[cfg(unix)]
     {
@@ -544,23 +592,35 @@ fn is_abrasive_command() -> bool {
         .map_or(true, |arg| ABRASIVE_COMMANDS.contains(&arg.as_str()))
 }
 
+fn dispatch_abrasive_command(
+    command: Option<Command>,
+    ctx: &Option<WorkspaceContext>,
+) -> CliResult<ExitCode> {
+    match command {
+        None => print_help(),
+        Some(thing) => match thing {
+            Command::Setup => remote_setup(ctx)?,
+            Command::Auth => login()?,
+            Command::Version => print_version(),
+            Command::Help => print_help(),
+            Command::Workspace => print_workspace(ctx)?,
+            Command::Tip => print_tip()?,
+        },
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> CliResult<ExitCode> {
     spawn_agent_for_next_time();
+    let ctx = get_workspace()?;
 
     if is_abrasive_command() {
         let cli = Cli::parse();
-        match cli.command {
-            Some(Command::Setup) => remote_setup()?,
-            Some(Command::Auth) => login()?,
-            Some(Command::Version) => print_version(),
-            Some(Command::Help) => print_help(),
-            Some(Command::Workspace) => print_workspace()?,
-            None => print_help(),
-        }
-        return Ok(ExitCode::SUCCESS);
+        return dispatch_abrasive_command(cli.command, &ctx);
     }
 
-    let ctx = match get_workspace()? {
+    // Make sure we are actually in an abrasive workspace
+    let ctx = match ctx {
         None => return forward_args_to_local(),
         Some(ctx) => ctx,
     };
@@ -568,7 +628,7 @@ fn run() -> CliResult<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         None => return try_remote(&ctx, cli.cargo_args),
-        _ => unreachable!(),
+        _ => unreachable!(), // note to self, consider factoring this out
     }
 }
 
