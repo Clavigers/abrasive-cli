@@ -1,4 +1,4 @@
-use abrasive_cli::{agent, auth, tls};
+use abrasive::{agent, auth, tls};
 use abrasive_protocol::Message;
 use std::io;
 use std::net::{SocketAddr, TcpStream};

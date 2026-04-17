@@ -1,8 +1,10 @@
-use abrasive_cli::agent;
-use abrasive_cli::auth;
-use abrasive_cli::errors::{self, CliError, CliResult};
-use abrasive_cli::platform::host_triple;
-use abrasive_cli::tls;
+/// This is the entry point fot the abrasive CLI
+/// 
+use abrasive::agent;
+use abrasive::auth;
+use abrasive::errors::{self, CliError, CliResult};
+use abrasive::platform::host_triple;
+use abrasive::tls;
 use abrasive_protocol::{BuildRequest, FileEntry, Manifest, Message};
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -378,8 +380,10 @@ fn send_probe(
 
 fn open_connection(token: &str) -> CliResult<Conn> {
     if let Ok(stream) = UnixStream::connect(agent::socket_path()) {
+        eprintln!("[conn] via agent");
         return Ok(Conn::Agent(stream));
     }
+    eprintln!("[conn] via remote");
     let addr: SocketAddr = format!("{}:{}", IP, PORT).parse().unwrap();
     let tcp =
         TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(CliError::connect)?;
@@ -388,11 +392,19 @@ fn open_connection(token: &str) -> CliResult<Conn> {
     Ok(Conn::Ws(tls::connect(tcp, token).map_err(CliError::connect)?))
 }
 
+fn resolve_agent_bin() -> Option<PathBuf> {
+    if let Some(p) = env::var_os("ABRASIVE_AGENT_BIN") {
+        return Some(PathBuf::from(p));
+    }
+    let exe = env::current_exe().ok()?;
+    Some(exe.parent()?.join("abrasive-agent"))
+}
+
 fn spawn_agent_for_next_time() {
-    if agent::socket_path().exists() {
+    if UnixStream::connect(agent::socket_path()).is_ok() {
         return;
     }
-    let Some(agent_bin) = env::var_os("ABRASIVE_AGENT_BIN") else {
+    let Some(agent_bin) = resolve_agent_bin() else {
         return;
     };
     let Ok(child) = Cmd::new(agent_bin)
@@ -501,7 +513,7 @@ fn find_abrasive_toml(start: &Path) -> Option<PathBuf> {
 }
 
 fn forward_args_to_local() -> CliResult<ExitCode> {
-/// Transparent on unix, probably close enough on windows
+// Transparent on unix, probably close enough on windows
     let args: Vec<String> = env::args().skip(1).collect();
     #[cfg(unix)]
     {

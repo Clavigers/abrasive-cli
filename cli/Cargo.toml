@@ -1,12 +1,15 @@
 [package]
-name = "abrasive-cli"
-version = "0.0.0"
+name = "abrasive"
+version = "0.0.1"
 edition = "2024"
+description = "Simple remote cargo CLI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Clavigers/abrasive-cli"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "color", "help"] }
 thiserror = "2.0.18"
-abrasive-protocol = { path = "../protocol" }
+abrasive-protocol = { path = "../protocol", version = "0.0.1" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 blake3 = "1"
