@@ -211,10 +211,10 @@ pub fn saved_api_token() -> Option<String> {
 }
 
 fn credentials_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("abrasive").join("credentials.toml"))
+    let home = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)?;
+    Some(home.join(".abrasive").join("credentials.toml"))
 }
 
 fn write_credentials(token: &str) -> Result<(), AuthError> {
