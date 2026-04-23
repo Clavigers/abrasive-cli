@@ -274,19 +274,6 @@ enum SyncOutcome {
     SlotsBusy,
 }
 
-fn start_sync(stream: &mut Conn, root: &Path, team: &str, scope: &str) -> CliResult<SyncOutcome> {
-    let manifest = build_and_log_manifest(root, team, scope);
-    send_frame(stream, &Message::Manifest(manifest))?;
-    match recv_frame(stream)? {
-        Message::NeedFiles(paths) => Ok(SyncOutcome::Ready(paths)),
-        Message::SlotsBusy => Ok(SyncOutcome::SlotsBusy),
-        other => {
-            eprintln!("{} unexpected message: {other:?}", tags::LOCAL);
-            Err(CliError::disconnected())
-        }
-    }
-}
-
 fn build_and_log_manifest(root: &Path, team: &str, scope: &str) -> Manifest {
     eprintln!("{} scanning files...", tags::LOCAL);
     let files = build_manifest(root);
@@ -419,64 +406,152 @@ fn attempt_build(
     let mut stream = open_connection(token)?;
     let team = &ctx.config.remote.team;
     let scope = &ctx.config.remote.scope;
-    match send_probe(&mut stream, ctx, cargo_args)? {
-        ProbeResult::SlotsBusy => Ok(BuildOutcome::SlotsBusy),
-        ProbeResult::Accepted => {
-            eprintln!("{} fingerprint matched, skipping manifest", tags::LOCAL);
-            let (code, art) = stream_build_output(&mut stream)?;
-            Ok(BuildOutcome::Done(code, art))
-        }
-        ProbeResult::Miss => match start_sync(&mut stream, &ctx.root_dir, team, scope)? {
-            SyncOutcome::SlotsBusy => Ok(BuildOutcome::SlotsBusy),
-            SyncOutcome::Ready(needed) => {
-                stream_files(&mut stream, &ctx.root_dir, needed)?;
-                wait_for_sync_ack(&mut stream)?;
-                let (code, art) = stream_build_output(&mut stream)?;
-                Ok(BuildOutcome::Done(code, art))
-            }
-        },
-    }
-}
 
-enum ProbeResult {
-    Accepted,
-    Miss,
-    SlotsBusy,
-}
-
-fn send_probe(
-    stream: &mut Conn,
-    ctx: &WorkspaceContext,
-    cargo_args: &[String],
-) -> CliResult<ProbeResult> {
+    let files = build_manifest(&ctx.root_dir);
     let fp = fingerprint(&ctx.root_dir);
-    let request = BuildRequest {
+    let last = agent_get_last_sync(scope);
+    let changed = changed_paths(&files, last.as_ref());
+    let speculative = build_speculative(&ctx.root_dir, team, scope, &files, &changed)?;
+    log_speculative(changed.len(), speculative.files.len());
+
+    send_frame(
+        &mut stream,
+        &Message::Probe {
+            fingerprint: fp,
+            request: build_request(ctx, cargo_args),
+            speculative: Some(speculative),
+        },
+    )?;
+
+    let outcome = match recv_frame(&mut stream)? {
+        Message::ProbeAccepted => {
+            eprintln!("{} fingerprint matched, skipping sync", tags::LOCAL);
+            None
+        }
+        Message::SyncAck => {
+            eprintln!("{} speculative sync complete", tags::LOCAL);
+            None
+        }
+        Message::NeedFiles(paths) => {
+            eprintln!(
+                "{} speculative missed {} files, sending them now",
+                tags::LOCAL,
+                paths.len()
+            );
+            stream_files(&mut stream, &ctx.root_dir, paths)?;
+            wait_for_sync_ack(&mut stream)?;
+            None
+        }
+        Message::ProbeMiss => {
+            eprintln!("{} legacy sync path", tags::LOCAL);
+            match legacy_sync(&mut stream, &ctx.root_dir, team, scope)? {
+                SyncOutcome::SlotsBusy => return Ok(BuildOutcome::SlotsBusy),
+                SyncOutcome::Ready(needed) => {
+                    stream_files(&mut stream, &ctx.root_dir, needed)?;
+                    wait_for_sync_ack(&mut stream)?;
+                }
+            }
+            None
+        }
+        Message::SlotsBusy => Some(BuildOutcome::SlotsBusy),
+        other => {
+            eprintln!("{} unexpected probe response: {other:?}", tags::LOCAL);
+            return Err(CliError::disconnected());
+        }
+    };
+    if let Some(busy) = outcome {
+        return Ok(busy);
+    }
+
+    let (code, art) = stream_build_output(&mut stream)?;
+    record_sync_state(scope, fp, &files);
+    Ok(BuildOutcome::Done(code, art))
+}
+
+fn build_request(ctx: &WorkspaceContext, cargo_args: &[String]) -> BuildRequest {
+    BuildRequest {
         cargo_args: cargo_args.to_vec(),
         subdir: ctx.subdir.clone(),
         host_platform: host_triple(),
         team: ctx.config.remote.team.clone(),
         scope: ctx.config.remote.scope.clone(),
+    }
+}
+
+fn changed_paths(current: &[FileEntry], last: Option<&agent::LastSyncState>) -> Vec<String> {
+    let Some(last) = last else { return Vec::new() };
+    current
+        .iter()
+        .filter(|f| last.files.get(&f.path) != Some(&f.hash))
+        .map(|f| f.path.clone())
+        .collect()
+}
+
+fn build_speculative(
+    root: &Path,
+    team: &str,
+    scope: &str,
+    files: &[FileEntry],
+    changed: &[String],
+) -> CliResult<abrasive_protocol::SpeculativeSync> {
+    let files_gz = Manifest::encode_files(files);
+    let manifest = Manifest {
+        team: team.to_string(),
+        scope: scope.to_string(),
+        files_gz,
     };
-    send_frame(
-        stream,
-        &Message::Probe {
-            fingerprint: fp,
-            request,
-        },
-    )?;
+    let mut bundle = Vec::with_capacity(changed.len());
+    for path in changed {
+        if let Ok(contents) = fs::read(root.join(path)) {
+            bundle.push((path.clone(), contents));
+        }
+    }
+    Ok(abrasive_protocol::SpeculativeSync {
+        manifest,
+        files: bundle,
+    })
+}
+
+fn log_speculative(expected: usize, sent: usize) {
+    eprintln!(
+        "{} sync probe ({} changed, {} bundled)",
+        tags::LOCAL,
+        expected,
+        sent
+    );
+}
+
+fn record_sync_state(scope: &str, fp: [u8; 32], files: &[FileEntry]) {
+    let state = agent::LastSyncState {
+        fingerprint: fp,
+        files: files.iter().map(|f| (f.path.clone(), f.hash)).collect(),
+    };
+    agent_set_last_sync(scope, state);
+}
+
+/// Fallback for daemons that still send ProbeMiss instead of the new
+/// speculative-sync responses. Matches the old 3-RTT flow exactly.
+fn legacy_sync(
+    stream: &mut Conn,
+    root: &Path,
+    team: &str,
+    scope: &str,
+) -> CliResult<SyncOutcome> {
+    let manifest = build_and_log_manifest(root, team, scope);
+    send_frame(stream, &Message::Manifest(manifest))?;
     match recv_frame(stream)? {
-        Message::ProbeAccepted => Ok(ProbeResult::Accepted),
-        Message::ProbeMiss => Ok(ProbeResult::Miss),
-        Message::SlotsBusy => Ok(ProbeResult::SlotsBusy),
+        Message::NeedFiles(paths) => Ok(SyncOutcome::Ready(paths)),
+        Message::SlotsBusy => Ok(SyncOutcome::SlotsBusy),
         other => {
-            eprintln!("{} unexpected probe response: {other:?}", tags::LOCAL);
+            eprintln!("{} unexpected message: {other:?}", tags::LOCAL);
             Err(CliError::disconnected())
         }
     }
 }
 
 fn open_connection(token: &str) -> CliResult<Conn> {
-    if let Ok(stream) = UnixStream::connect(agent::socket_path()) {
+    if let Ok(mut stream) = UnixStream::connect(agent::socket_path()) {
+        agent::send_request(&mut stream, &agent::AgentRequest::StartProxy)?;
         eprintln!("{} via agent", tags::LOCAL);
         return Ok(Conn::Agent(stream));
     }
@@ -489,6 +564,35 @@ fn open_connection(token: &str) -> CliResult<Conn> {
     Ok(Conn::Ws(
         tls::connect(tcp, token).map_err(CliError::connect)?,
     ))
+}
+
+fn agent_get_last_sync(scope: &str) -> Option<agent::LastSyncState> {
+    let mut stream = UnixStream::connect(agent::socket_path()).ok()?;
+    agent::send_request(
+        &mut stream,
+        &agent::AgentRequest::GetLastSync {
+            scope: scope.to_string(),
+        },
+    )
+    .ok()?;
+    match agent::recv_response(&mut stream).ok()? {
+        agent::AgentResponse::LastSync(state) => state,
+        _ => None,
+    }
+}
+
+fn agent_set_last_sync(scope: &str, state: agent::LastSyncState) {
+    let Ok(mut stream) = UnixStream::connect(agent::socket_path()) else {
+        return;
+    };
+    let _ = agent::send_request(
+        &mut stream,
+        &agent::AgentRequest::SetLastSync {
+            scope: scope.to_string(),
+            state,
+        },
+    );
+    let _ = agent::recv_response(&mut stream);
 }
 
 fn resolve_agent_bin() -> Option<PathBuf> {

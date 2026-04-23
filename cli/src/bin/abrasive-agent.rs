@@ -1,14 +1,22 @@
-use abrasive::{agent, auth, tags, tls};
+use abrasive::agent::{self, AgentRequest, AgentResponse, LastSyncState};
+use abrasive::{auth, tags, tls};
 use abrasive_protocol::Message;
+use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Mutex;
 use std::time::Duration;
 use std::{fs, process};
 use tungstenite::Message as WsMessage;
 
 const IP: &str = "157.180.55.180";
 const PORT: u16 = 8400;
+
+/// Per-scope speculative-sync state, held in memory for the agent's
+/// lifetime. Key is the scope name; lost on agent restart, at which point
+/// the first build after restart just falls back to a full sync.
+type SyncCache = Mutex<HashMap<String, LastSyncState>>;
 
 fn main() {
     let token = auth::saved_token().unwrap_or_else(|| {
@@ -27,17 +35,61 @@ fn main() {
             None
         }
     };
+    let sync_cache: SyncCache = Mutex::new(HashMap::new());
     let listener = UnixListener::bind(&path).expect("failed to bind agent socket");
     eprintln!("{} listening on {}", tags::LOCAL, path.display());
     for client in listener.incoming().flatten() {
-        if let Err(e) = handle(client, &token, &mut ws) {
+        if let Err(e) = handle(client, &token, &mut ws, &sync_cache) {
             eprintln!("{} session error: {e}", tags::LOCAL);
             ws = None;
         }
     }
 }
 
-fn handle(mut client: UnixStream, token: &str, ws: &mut Option<tls::WsConn>) -> io::Result<()> {
+fn handle(
+    mut client: UnixStream,
+    token: &str,
+    ws: &mut Option<tls::WsConn>,
+    sync_cache: &SyncCache,
+) -> io::Result<()> {
+    let request = match agent::recv_request(&mut client) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match request {
+        AgentRequest::GetLastSync { scope } => handle_get_last_sync(&mut client, sync_cache, &scope),
+        AgentRequest::SetLastSync { scope, state } => {
+            handle_set_last_sync(&mut client, sync_cache, scope, state)
+        }
+        AgentRequest::StartProxy => handle_proxy(client, token, ws),
+    }
+}
+
+fn handle_get_last_sync(
+    client: &mut UnixStream,
+    sync_cache: &SyncCache,
+    scope: &str,
+) -> io::Result<()> {
+    let state = sync_cache.lock().unwrap().get(scope).cloned();
+    agent::send_response(client, &AgentResponse::LastSync(state))
+}
+
+fn handle_set_last_sync(
+    client: &mut UnixStream,
+    sync_cache: &SyncCache,
+    scope: String,
+    state: LastSyncState,
+) -> io::Result<()> {
+    sync_cache.lock().unwrap().insert(scope, state);
+    agent::send_response(client, &AgentResponse::Ok)
+}
+
+fn handle_proxy(
+    mut client: UnixStream,
+    token: &str,
+    ws: &mut Option<tls::WsConn>,
+) -> io::Result<()> {
     if ws.is_none() {
         *ws = Some(connect(token)?);
         eprintln!("{} connected to daemon", tags::LOCAL);

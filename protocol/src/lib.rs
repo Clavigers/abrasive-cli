@@ -32,6 +32,13 @@ pub enum Message {
     Probe {
         fingerprint: [u8; 32],
         request: BuildRequest,
+        /// Speculative sync bundle. If the fingerprint doesn't match the
+        /// cache, the daemon uses this to skip the
+        /// Manifest → NeedFiles → FileData round-trips: it already has
+        /// the manifest, and if every file the daemon needs was bundled,
+        /// it proceeds straight to the build. Optional so first-ever
+        /// syncs (no client state yet) can still work.
+        speculative: Option<SpeculativeSync>,
     },
     ProbeAccepted,
     ProbeMiss,
@@ -98,6 +105,17 @@ impl Message {
             Message::BuildFinished { .. } | Message::SlotsBusy | Message::Tip(_)
         )
     }
+}
+
+/// Speculative bundle sent alongside a Probe to collapse the 3-RTT sync
+/// (Probe → ProbeMiss → Manifest → NeedFiles → FileData → SyncAck) down
+/// to 1 when the client correctly guesses what the daemon is missing.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SpeculativeSync {
+    pub manifest: Manifest,
+    /// (path, file contents) for every file the client thinks the daemon
+    /// doesn't have yet.
+    pub files: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

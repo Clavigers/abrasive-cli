@@ -7,6 +7,7 @@ name = "abrasive"
 version = "0.0.1"
 dependencies = [
  "abrasive-protocol",
+ "bincode",
  "blake3",
  "clap",
  "ignore",
