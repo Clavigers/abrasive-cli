@@ -403,16 +403,20 @@ fn attempt_build(
     cargo_args: &[String],
     token: &str,
 ) -> CliResult<BuildOutcome> {
-    let mut stream = open_connection(token)?;
     let team = &ctx.config.remote.team;
     let scope = &ctx.config.remote.scope;
 
+    // Query agent state BEFORE opening the proxy — the agent is
+    // single-threaded, so holding a proxy connection open while trying
+    // to make a second agent RPC call deadlocks.
     let files = build_manifest(&ctx.root_dir);
     let fp = fingerprint(&ctx.root_dir);
     let last = agent_get_last_sync(scope);
     let changed = changed_paths(&files, last.as_ref());
     let speculative = build_speculative(&ctx.root_dir, team, scope, &files, &changed)?;
-    log_speculative(changed.len(), speculative.files.len());
+    let bundled_count = speculative.files.len();
+
+    let mut stream = open_connection(token)?;
 
     send_frame(
         &mut stream,
@@ -429,12 +433,16 @@ fn attempt_build(
             None
         }
         Message::SyncAck => {
-            eprintln!("{} speculative sync complete", tags::LOCAL);
+            let noun = if bundled_count == 1 { "file" } else { "files" };
+            eprintln!(
+                "{} synced ({bundled_count} {noun} in probe)",
+                tags::LOCAL
+            );
             None
         }
         Message::NeedFiles(paths) => {
             eprintln!(
-                "{} speculative missed {} files, sending them now",
+                "{} synced ({bundled_count} bundled, {} straggler(s))",
                 tags::LOCAL,
                 paths.len()
             );
@@ -510,15 +518,6 @@ fn build_speculative(
         manifest,
         files: bundle,
     })
-}
-
-fn log_speculative(expected: usize, sent: usize) {
-    eprintln!(
-        "{} sync probe ({} changed, {} bundled)",
-        tags::LOCAL,
-        expected,
-        sent
-    );
 }
 
 fn record_sync_state(scope: &str, fp: [u8; 32], files: &[FileEntry]) {
